@@ -1,0 +1,12 @@
+output/
+tools/
+tools_armor/
+__pycache__/
+*.pyc
+*.bak
+*.orig
+*.s3d
+*.eqg
+*.dds
+*.bmp
+*.glb

@@ -1,0 +1,18 @@
+# Custom zones not covered by a continent list (the rest are in antonica, faydwer,
+# kunark, velious, luclin, pop). Newer zones are .eqg (eqgzone.py).
+thevoida
+fearplane
+hateplane
+ferubi
+inktuta
+tacvi
+txevu
+anguish
+ashengate
+chapterhouse
+convorteum
+dreadspire
+frostcrypt
+oldkaesoraa
+riftseekers
+somnium
