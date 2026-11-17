@@ -881,6 +881,42 @@ def unfake(material):
     return int(material[0]) + 256 * int(material[1])
 
 
+def shark_lasers(bones):
+    """Two laser cannons on top of the shark's head, each firing a red beam straight ahead. They ride the head bone,
+    so they turn with it. Built in rest-pose world space (the shark faces +x, its head bone sits at x 2.64)."""
+    frame = {n: T for n, _p, (_R, T) in bones}
+    P = bones[0][0][:3]
+    he = f'{P}HE_DAG'
+    if he not in frame:
+        return []
+    GREY, DARK, RED, HOT = (100, 100, 108), (42, 42, 48), (220, 20, 20), (255, 150, 140)
+    out = []
+
+    def part(name, color, center):
+        p = minifig.Part(name, he, None, center)
+        out.append((p, color))
+        return p
+
+    def box(name, color, x0, x1, y0, y1, z0, z1):
+        ring = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0), (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
+        minifig.hexa(part(name, color, np.mean(ring, 0)), ring)
+
+    for s in (1, -1):
+        y = 0.32 * s
+        box('laser mount', GREY, 2.45, 2.85, y - 0.13, y + 0.13, 0.4, 0.64)  # on the head bricks' studs
+        a, b = np.array((2.4, y, 0.74)), np.array((3.1, y, 0.74))
+        minifig.cylinder(part('laser barrel', DARK, (a + b) / 2), a, b, 0.09, seg=12)
+        a, b = np.array((3.1, y, 0.74)), np.array((3.18, y, 0.74))
+        minifig.cylinder(part('laser lens', HOT, (a + b) / 2), a, b, 0.07, seg=12)
+        a, b = np.array((3.18, y, 0.74)), np.array((7.2, y, 0.74))
+        minifig.cylinder(part('laser beam', RED, (a + b) / 2), a, b, 0.07, seg=8)
+    return out
+
+
+# Extra built parts on a creature, after bricking: prefix -> f(bones) giving [(Part, rgb)].
+EXTRAS = {'SHA': shark_lasers}
+
+
 def build_creature(w, sid, textures, voxels, ncolors=5):
     bones, mesh_ids = w.skeleton(sid)
     prefix = w.frags[sid][1].split('_')[0]
@@ -933,8 +969,11 @@ def build_creature(w, sid, textures, voxels, ncolors=5):
         filled = filled & ~np.isin(bone, on)
         for p, role in head:
             p.material = fake(classes.setdefault(tuple(c for s in schemes for c in s[role]), len(classes)))
+    extra = EXTRAS[prefix](bones) if prefix in EXTRAS else []
+    for p, rgb in extra:  # the same color in every texture variant
+        p.material = fake(classes.setdefault(tuple(rgb) * len(vlist), len(classes)))
     classes = list(classes)
-    parts = build_parts(lo, size, filled, cls, bone, bone_names) + [p for p, _r in head]
+    parts = build_parts(lo, size, filled, cls, bone, bone_names) + [p for p, _r in head] + [p for p, _r in extra]
     for p in parts:
         if not isinstance(p.material, str) and classes[unfake(p.material)][-1] == 'glass':
             p.glass = glass_mat

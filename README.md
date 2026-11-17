@@ -52,6 +52,7 @@ zones/        brick zones, one folder per continent
 
 scripts/
   make_update.py      copy only changed files into transfer batches
+  snapshot.py         snapshot tester: render every model in built archives, diff against accepted renders
   fix_flattened.py    finish hiding meshes an older build only half hid (stretched triangles)
   fix_track_scale.py  retired (see its docstring); kept for the record
 ```
@@ -83,3 +84,18 @@ Build history and findings: [docs/notes.md](docs/notes.md).
 
 MIT: see [LICENSE](LICENSE). This covers the scripts only. EverQuest and its game files belong to their owners
 and are not part of this project.
+
+## Snapshot tester
+
+`scripts/snapshot.py` renders each model in built `.s3d` archives (front, three-quarter, side) and compares the
+renders with the last accepted ones, so a model tweak shows exactly what it changed and nothing else.
+
+```
+python -I scripts/snapshot.py accept output/creatures            # take the current renders as the baseline
+python -I scripts/snapshot.py check  output/creatures            # after a tweak: list changed / new / missing
+python -I scripts/snapshot.py show   output/creatures --only SHA # just render, for a quick preview
+```
+
+`check` writes an accepted / new / changed-pixels sheet per changed model and a `report.png` of all of them under
+`output/snapshots/report`, and exits 1 when anything differs. Each baseline keeps its camera framing, so a part that
+grows does not re-zoom the whole render. Old-format `.s3d` models only; `.eqg` models are not drawn yet.
