@@ -87,11 +87,16 @@ def dds_dxt1(im):
 
 
 # ------------------------------------------------------------------------------------------------ mesh
-def mesh_body(w, frag_index, parts, bones, uvmap, material):
+def mesh_body(w, frag_index, parts, bones, uvmap, material, header=None, materials=None):
+    """A 0x36 mesh of the parts in place of fragment frag_index. header (96 bytes) and materials (names) stand in
+    for the old mesh's when it isn't a 0x36 (an old 0x2C mesh)."""
     _t, name, old = w.frags[frag_index]
-    m = w.mesh(frag_index)
+    if materials is None:
+        materials = [n for n, _m, _t2 in w.mesh(frag_index)['materials']]
+    if header is not None:
+        old = header
     mat_of = material if callable(material) else (lambda _p: material)  # material name per part
-    mat_ids = {n: i for i, (n, _m, _t2) in enumerate(m['materials'])}
+    mat_ids = {n: i for i, n in enumerate(materials)}
     bone_index = {n: i for i, (n, _p, _w) in enumerate(bones)}
 
     # Vertices grouped by bone (the mesh stores runs of vertices per bone), each in that bone's rest-pose space

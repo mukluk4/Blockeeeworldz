@@ -53,6 +53,8 @@ zones/        brick zones, one folder per continent
 scripts/
   make_update.py      copy only changed files into transfer batches
   snapshot.py         snapshot tester: render every model in built archives, diff against accepted renders
+  review.py           mob review: brick every creature, draw stock/brick/mid-animation, flag likely problems
+  review_render.py    review.py's drawing and checks
   fix_flattened.py    finish hiding meshes an older build only half hid (stretched triangles)
   fix_track_scale.py  retired (see its docstring); kept for the record
 ```
@@ -68,7 +70,11 @@ python -I characters/make_armor_sets.py <client> <races out dir> <out>
 python -I characters/helmets.py <lgequip_amr.s3d.orig> <out> <client>/brick_orig
 python -I characters/hairpieces.py <lgequip.s3d.orig> <out> <client>/brick_orig
 python -I characters/robes.py <hair-built lgequip.s3d> <out> <client>/brick_orig
+python -I characters/brick_all_copies.py <client> <out> @characters/creatures.txt --read-only -j 4
 ```
+
+`brick_all_copies.py --read-only` builds every creature copy from an untouched stock client without writing a
+`brick_orig` backup into it; `-j` runs several archives at once.
 
 ## What the client needs (each of these crashed eqgame in EQGraphicsDX9.dll)
 
@@ -99,3 +105,45 @@ python -I scripts/snapshot.py show   output/creatures --only SHA # just render, 
 `check` writes an accepted / new / changed-pixels sheet per changed model and a `report.png` of all of them under
 `output/snapshots/report`, and exits 1 when anything differs. Each baseline keeps its camera framing, so a part that
 grows does not re-zoom the whole render. Old-format `.s3d` models only; `.eqg` models are not drawn yet.
+
+## Mob review
+
+`scripts/review.py` goes through every creature in `characters/creatures.txt` to find the ones that need a tweak:
+
+```
+python -I scripts/review.py all <client folder>        # index, build, render (build is slow, and resumes)
+python -I scripts/review.py render <client folder> --only SHA,BEA   # redraw a few after a change
+```
+
+It reads the stock client (never writes it), bricks each creature once from its own archive into
+`output/review/brick`, and draws one picture per creature in `output/review/img`: stock, brick, and the brick model
+mid-animation (walk, swim or attack), all from one camera so sizes compare. `output/review/review.json` lists each
+creature's flags: `not built`, `apart in motion` (a limb's bricks pull away from its parent's while animating),
+`detached`, `empty limb`, `stretched` (sliver triangles), `size`, `sunk`, `few bricks`, `few colors`. The flags only
+point at likely problems; the pictures are for judging the look. `build --only` rebuilds every creature in the
+archives it touches, so shared archives stay whole.
+
+### Eyes
+
+Small painted eyes get lost when a head becomes a few bricks, so brick creatures get built eyes: a disc in the stock
+eye's color with a pupil and a glint, on the head bricks where the stock eye is. Which spots are eyes is picked by
+hand, once, and kept in `characters/creature_eyes.json`:
+
+```
+python -I scripts/eyes.py sheet <client folder>         # numbered eye candidates on every stock head
+python -I scripts/eyes.py pick RAT=1 SNA=3 BEA=0         # candidate pair per creature, 0 = no eyes
+python -I scripts/eyes.py pick KOP=front MAM=side PUS=front:red   # eyes placed by the head's shape instead
+python -I scripts/eyes.py sheet <client folder> --none  # the heads with no candidates, to check
+```
+
+Candidates are mirrored pairs of small patches that stand out from the skin around them, high on the head; a creature
+not in the file gets no eyes. Shaped eyes (`front`, `side`, optional color) are for heads whose eyes don't stand out
+in the texture. Creatures without a head bone get none.
+
+### Hunched minifigs
+
+Minifigs sit their hips and shoulders a little below the skeleton's joints, which suits upright figures. Creatures in
+`JOINT_FIT` (`brickcreature.py`: those with deep crouching walks) are fitted with the hips and shoulders on their
+joints and the body over their spine instead, so their limbs stay on when they move. Brick creatures get a similar
+pass: a stray clump of bricks that doesn't touch any of its limb's ancestors moves with the limb it does touch, and a
+limb's main clump that floats gets a short bridge of bricks to the nearest ancestor brick.

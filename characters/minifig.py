@@ -826,18 +826,27 @@ NECK_TOP = 1.8
 def landmarks(prefix, bones):
     """The joints fit() needs, from a race's skeleton {bone name: rest-pose position}."""
     b = lambda n: np.array(bones[f'{prefix}{n}_DAG'], float)
-    return {'foot': b('BOFOOTL')[2], 'hip': b('THTHIGHL')[2], 'shoulder': b('BIBICEPL')[2],
+    return {'foot': b('BOFOOTL')[2], 'hip': b('THTHIGHL')[2], 'hip_x': b('THTHIGHL')[0], 'shoulder': b('BIBICEPL')[2],
             'bicep': b('BIBICEPL'), 'hand': b('FIHANDL')}
 
 
-def fit(parts, prefix, bones):
+LEG_TOP = -0.9  # where the figure's legs meet its hips
+
+
+def fit(parts, prefix, bones, joints=False):
     """Move a figure built on the Dwarf skeleton onto another race's skeleton (same bone names, other prefix).
 
     Heights between the foot, hip and shoulder joints are stretched to that race's joints; below the foot and above
     the shoulder they only shift. The head group moves as one piece, and each arm turns at the shoulder to follow
-    the race's resting arm (and is shortened or lengthened to its arm's length)."""
+    the race's resting arm (and is shortened or lengthened to its arm's length).
+    joints: put the figure's leg tops and shoulders on the race's hip and shoulder joints (longer legs, shorter
+    torso) and its body over the race's spine front to back, so limbs swing from where they meet the body. For
+    hunched creatures (goblins, lizard men), whose deep crouches throw the usual fit's limbs off the body."""
     t = landmarks(prefix, bones)
-    src = [DWARF['foot'], DWARF['hip'], DWARF['shoulder']]
+    src = [DWARF['foot'], LEG_TOP if joints else DWARF['hip'], SHOULDER if joints else DWARF['shoulder']]
+    dx = np.zeros(3)
+    if joints:  # front to back: the figure's middle onto the middle of the race's hip and shoulder joints
+        dx[0] = (t['hip_x'] + t['bicep'][0]) / 2 - BX
     dst = [t['foot'], t['hip'], t['shoulder']]
 
     def zmap(z):
@@ -879,8 +888,8 @@ def fit(parts, prefix, bones):
             def turn_n(n, side=side):
                 a = n[1] * side
                 return np.array([n[0], side * (a * c - n[2] * s), a * s + n[2] * c])
-        p.tris = [[(move(v), turn_n(n), uv) for v, n, uv in tri] for tri in p.tris]
-        p.center = move(p.center)
+        p.tris = [[(move(v) + dx, turn_n(n), uv) for v, n, uv in tri] for tri in p.tris]
+        p.center = move(p.center) + dx
         p.bone = prefix + p.bone[3:]
     return parts
 

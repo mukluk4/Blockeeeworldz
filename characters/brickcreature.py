@@ -9,7 +9,7 @@ texture variations look the same; extra head meshes are folded away.
     python -I brickcreature.py <in _chr.s3d> <out _chr.s3d> [voxels along the longest side or -, default 18] [only: BEA,ORC,...]
 Writes <out>_<PREFIX>_preview.png for each creature.
 """
-import copy, io, math, os, re, struct, sys
+import copy, io, json, math, os, re, struct, sys
 import numpy as np
 from PIL import Image
 
@@ -57,6 +57,12 @@ PEOPLE = {'FPM': ('hum', {}), 'QCM': ('hum', {}), 'QCF': ('huf', {}),
                           'legs': (114, 14, 15), 'hips': LIGHT_GREY, 'chains': LIGHT_GREY}),
           'SKE': ('hum', {'skin': WHITE, 'hair': None, 'shirt': WHITE, 'arms': WHITE, 'legs': WHITE,
                           'hips': WHITE, 'trim': WHITE, 'face': 'skull', 'print': 'ribs', 'bony': True})}
+# Hunched creatures whose minifig is fitted with its hips and shoulders on their joints (minifig.fit joints=True):
+# with the usual fit their deep crouch walks swing the limbs off the body (mob review, 2026-11-18)
+# Minifigs whose legs stand still on one bone (prefix -> bone): a knee that bends far from where the figure's leg
+# can bend pulls the shin and foot off it, and SSN's thighs swing nearly flat in its hunched walk
+RIGID_LEGS = {}
+JOINT_FIT = {'GOB', 'GHU', 'LIZ', 'SSK', 'SSN', 'SRW', 'SCA', 'VSF', 'VSM', 'DEN', 'ZEB'}
 # Old-style humanoid bone (prefix stripped) for each bone the minifig is designed on; ? = side
 OLD_BONES = {'THTHIGH': 'TH_?', 'CACALF': 'CA_?', 'BOFOOT': 'BO_?', 'BIBICEP': 'BI_?', 'FOFOREARM': 'FO_?',
              'FIHAND': 'FI_?', 'PEPELVIS': 'PE', 'CHCHEST': 'CH', 'NENECK': 'NE', 'HEHEAD': 'HE'}
@@ -73,9 +79,9 @@ def texture_images(files):
     return out
 
 
-def sample_surface(w, bones, mesh_ids, textures, step, glass=None):
+def sample_surface(w, bones, mesh_ids, textures, step, glass=None, only=None):
     """Points on the rest-pose surface: [(position, color, bone)]. glass: a material name; then also a flag per point,
-    True where it lies on that material."""
+    True where it lies on that material. only: a set of bone indices; triangles on none of them are skipped."""
     pts, cols, bns, on_glass = [], [], [], []
     for mi in mesh_ids:
         m = w.mesh(mi)
@@ -86,6 +92,8 @@ def sample_surface(w, bones, mesh_ids, textures, step, glass=None):
         uvs = m['uvs'] if len(m['uvs']) == len(m['verts']) else [(0.0, 0.0)] * len(m['verts'])
         for a, b, c, mat in m['faces']:
             _name, method, tex = m['materials'][mat]
+            if only is not None and not any(m['bones'][q] in only for q in (a, b, c)):
+                continue
             is_glass = _name == glass
             if method == 0 or tex is None:  # invisible / boundary materials
                 continue
@@ -161,11 +169,156 @@ def voxelize(pts, cols, bns, size):
     return lo, filled, color, bone
 
 
-def palette_colors(color, filled, ncolors, fixed=None):
-    """A few main colors per creature (median cut over its cubes), each snapped to a brick color."""
+NEIGHBOURS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+
+
+def anchor_limbs(filled, bone, parents, color=None, rounds=8, reach=6):
+    """Every clump of cubes on a bone should touch cubes on one of that bone's ancestors, or it floats off the body
+    when the creature moves (a wing tip or toe whose cubes all fell next to a sibling bone's). A stray clump that
+    touches no ancestor goes onto the bone it touches most, so it moves with what it is attached to. A bone's main
+    (largest) clump stays on its bone, so the limb keeps moving; if it floats, a short bridge of cubes (at most
+    `reach` long) joins it to its nearest ancestor cube. Clumps with nothing near them (pieces that float in the
+    stock model too) are left alone. Changes filled/bone/color in place; returns cubes moved or added."""
+    dims = filled.shape
+    anc = []
+    for b in range(len(parents)):
+        a, p = set(), parents[b]
+        while p >= 0:
+            a.add(p)
+            p = parents[p]
+        anc.append(a)
+    moved = 0
+    used = set(bone[filled].tolist())
+    has_anc = [bool(a & used) for a in anc]  # a bone none of whose ancestors has bricks floats on nothing
+
+    def clumps():
+        seen = np.zeros(dims, bool)
+        out = []
+        for start in zip(*np.nonzero(filled)):
+            if seen[start]:
+                continue
+            b = bone[start]
+            clump, stack, touch = [start], [start], {}
+            seen[start] = True
+            while stack:
+                x, y, z = stack.pop()
+                for dx, dy, dz in NEIGHBOURS:
+                    q = (x + dx, y + dy, z + dz)
+                    if not (0 <= q[0] < dims[0] and 0 <= q[1] < dims[1] and 0 <= q[2] < dims[2]) or not filled[q]:
+                        continue
+                    if bone[q] == b:
+                        if not seen[q]:
+                            seen[q] = True
+                            clump.append(q)
+                            stack.append(q)
+                    else:
+                        touch[bone[q]] = touch.get(bone[q], 0) + 1
+            out.append((b, clump, touch))
+        return out
+
+    def floats(b, touch):
+        return b >= 0 and parents[b] >= 0 and has_anc[b] and not any(t in anc[b] for t in touch)
+
+    for _ in range(rounds):
+        found = clumps()
+        main = {}
+        for k, (b, clump, _t) in enumerate(found):
+            if b not in main or len(clump) > len(found[main[b]][1]):
+                main[b] = k
+        changed = 0
+        for k, (b, clump, touch) in enumerate(found):
+            if main.get(b) == k or not floats(b, touch):
+                continue
+            # only onto bones it doesn't carry (moving a body clump onto a leg would empty the body)
+            onto = {t: n for t, n in touch.items() if t >= 0 and b not in anc[t]}
+            if not onto:
+                continue
+            new = max(onto, key=onto.get)
+            for q in clump:
+                bone[q] = new
+            changed += len(clump)
+        moved += changed
+        if not changed:
+            break
+    # bridges for main clumps that float
+    for b, clump, touch in clumps():
+        if not floats(b, touch):
+            continue
+        targets = np.argwhere(filled & np.isin(bone, list(anc[b])))
+        if not len(targets):
+            continue
+        c = np.array(clump)
+        d = np.abs(c[:, None, :] - targets[None, :, :]).sum(2) if len(c) * len(targets) < 4_000_000 else None
+        if d is None:
+            continue
+        i, j = np.unravel_index(d.argmin(), d.shape)
+        if d[i, j] - 1 > reach:
+            continue
+        p, t = c[i].copy(), targets[j]
+        src = tuple(p)
+        for ax in np.argsort(-np.abs(t - p)):  # longest axis first, one axis at a time (stays face-connected)
+            while p[ax] != t[ax]:
+                p[ax] += 1 if t[ax] > p[ax] else -1
+                q = tuple(p)
+                if filled[q] and (bone[q] in anc[b] or bone[q] == b):
+                    continue
+                if filled[q] and bone[q] >= 0 and b in anc[bone[q]]:  # through one of its own children: keep it
+                    continue
+                filled[q] = True  # an empty cell, or a sibling's cube the bridge passes through
+                bone[q] = b
+                if color is not None:
+                    color[q] = color[src]
+                moved += 1
+    return moved
+
+
+# Creatures whose limbs hinge on a joint well inside the body (a wasp's wings): each limb's bricks get a path in to
+# its joint, so they turn around their own end instead of swinging off the body.
+PIVOT_BRIDGE = {'WAS'}
+
+
+def pivot_bridge(filled, bone, color, bones, lo, size, gap=2):
+    """For every bone whose nearest brick is more than `gap` cells from its joint, fill the cells from that brick to
+    the joint (taking the cubes on the way, its parent's too: near the joint they hardly move). -> cubes changed."""
+    dims = filled.shape
+    changed = 0
+    for k, (_n, parent, (_R, T)) in enumerate(bones):
+        if parent < 0:
+            continue
+        cells = np.argwhere(filled & (bone == k))
+        if not len(cells):
+            continue
+        j = np.clip(np.floor((np.asarray(T, float) - lo) / size).astype(int), 0, np.array(dims) - 1)
+        d = np.abs(cells - j).sum(1)
+        if d.min() <= gap:
+            continue
+        p = cells[d.argmin()].copy()
+        src = tuple(p)
+        for ax in np.argsort(-np.abs(j - p)):
+            while p[ax] != j[ax]:
+                p[ax] += 1 if j[ax] > p[ax] else -1
+                q = tuple(p)
+                if not filled[q] or bone[q] != k:
+                    filled[q] = True
+                    bone[q] = k
+                    color[q] = color[src]
+                    changed += 1
+    return changed
+
+
+def palette_colors(color, filled, ncolors, fixed=None, vivid=1):
+    """A few main colors per creature (median cut over its cubes), each snapped to a brick color. vivid > 1 counts
+    each brightly colored cube that many times when the colors are picked, so small trim keeps its own color."""
     cells = color[filled]
     row = Image.fromarray(np.clip(cells, 0, 255).astype(np.uint8)[None, :, :])
-    q = row.quantize(ncolors, method=Image.Quantize.MEDIANCUT)
+    if vivid > 1:
+        chroma = cells.max(1) - cells.min(1)
+        pick = np.concatenate([cells] + [cells[chroma > 50]] * (vivid - 1))
+        seed = Image.fromarray(np.clip(pick, 0, 255).astype(np.uint8)[None, :, :]).quantize(
+            ncolors, method=Image.Quantize.MEDIANCUT)
+        q = row.quantize(palette=seed, dither=Image.Dither.NONE)
+    else:
+        q = row.quantize(ncolors, method=Image.Quantize.MEDIANCUT)
     pal = np.array((q.getpalette() + [0] * 3 * ncolors)[:3 * ncolors], np.float32).reshape(ncolors, 3)
     if fixed:  # light to dark main colors onto the creature's own plastics, light to dark
         rank = np.argsort(-(pal @ np.array([0.3, 0.59, 0.11], np.float32)))
@@ -364,14 +517,19 @@ def build_person(w, sid, textures):
             name = f"{prefix}{OLD_BONES[key].replace('?', side)}_DAG"
         else:
             name = f'{prefix}HE_DAG' if key.startswith(('HE', 'FA')) else f'{prefix}CH_DAG'
-        for n in (name, f'{prefix}HEHEAD_DAG' if 'HE' in name else f'{prefix}CHCHEST_DAG', f'{prefix}CH_DAG'):
+        for n in (name, name.replace(prefix, prefix * 2, 1),  # SSNSSNBO_L_DAG: a stock bone named with its prefix twice
+                  f'{prefix}HEHEAD_DAG' if 'HE' in name else f'{prefix}CHCHEST_DAG', f'{prefix}CH_DAG'):
             if n in rest:
                 return n
         return bones[0][0]
     pos = {f'NPX{d}{s}_DAG': rest[old(d + s)] for d in ('BOFOOT', 'THTHIGH', 'BIBICEP', 'FIHAND') for s in 'LR'}
-    minifig.fit(parts, 'NPX', pos)
+    minifig.fit(parts, 'NPX', pos, joints=prefix in JOINT_FIT)
     for p in parts:
-        p.bone = old(p.bone[3:-4])
+        core = p.bone[3:-4]
+        if prefix in RIGID_LEGS and core[:-1] in ('THTHIGH', 'CACALF', 'BOFOOT', 'TOTOE'):
+            p.bone = RIGID_LEGS[prefix] if RIGID_LEGS[prefix] in rest else bones[0][0]
+            continue
+        p.bone = old(core)
     if opts.get('head') in ('pumpkin', 'squid'):  # Samhain's jack-o'-lantern, the Amygdalan's squid head: in place
         head = [p for p in parts if getattr(p, 'group', '') == 'head']  # of the minifig head (and its hair)
         vs = np.array([v[0] for p in head for t in p.tris for v in t])
@@ -803,7 +961,7 @@ COLOR_RULES = {'BET': fire_beetle, 'DRA': dragon}
 HEADS = {'DRA': (dragon_scheme, lambda bones, w, mesh_ids: dragon_head(bones), ('HE', 'JA'))}
 HEADS.update({p: (own_scheme, fitted_head, ('HE', 'JA'))
               for p in ('DR2', 'BWD', 'CCD', 'PRI', 'TRK', 'DRU', 'GDR', 'DRK', 'WUR', 'WYV')})
-VOXELS = {'NMG': 30, 'DRA': 30, 'TRK': 45, 'CCD': 45, 'PRI': 45, 'DR2': 45, 'BWD': 45, 'DRU': 45, 'TMT': 30, 'GDR': 30}  # big creatures that need finer bricks to keep their shape
+VOXELS = {'SHM': 32, 'NMG': 30, 'DRA': 30, 'TRK': 45, 'CCD': 45, 'PRI': 45, 'DR2': 45, 'BWD': 45, 'DRU': 45, 'TMT': 30, 'GDR': 30}  # big creatures that need finer bricks to keep their shape
 
 
 # Texture variants: <prefix><part><variant><index>, e.g. giach0101 = giant chest, variant 1. The NPC's texture
@@ -881,8 +1039,9 @@ def unfake(material):
     return int(material[0]) + 256 * int(material[1])
 
 
-def shark_lasers(bones):
-    """Two laser cannons on top of the shark's head, each firing a red beam straight ahead. They ride the head bone,
+def shark_lasers(bones, grid=None):
+    """Two laser cannons on top of the shark's head, each firing a red beam straight ahead, and an angry cartoon eye on
+    each side of the head. They ride the head bone,
     so they turn with it. Built in rest-pose world space (the shark faces +x, its head bone sits at x 2.64)."""
     frame = {n: T for n, _p, (_R, T) in bones}
     P = bones[0][0][:3]
@@ -890,6 +1049,7 @@ def shark_lasers(bones):
     if he not in frame:
         return []
     GREY, DARK, RED, HOT = (100, 100, 108), (42, 42, 48), (220, 20, 20), (255, 150, 140)
+    BLACK = (20, 20, 22)
     out = []
 
     def part(name, color, center):
@@ -910,11 +1070,393 @@ def shark_lasers(bones):
         minifig.cylinder(part('laser lens', HOT, (a + b) / 2), a, b, 0.07, seg=12)
         a, b = np.array((3.18, y, 0.74)), np.array((7.2, y, 0.74))
         minifig.cylinder(part('laser beam', RED, (a + b) / 2), a, b, 0.07, seg=8)
+        # an eye on each side of the head: white disc, black pupil toward the front, a glint
+        a, b = np.array((3.02, 1.37 * s, 0.12)), np.array((3.02, 1.43 * s, 0.12))
+        minifig.cylinder(part('eye', WHITE, (a + b) / 2), a, b, 0.21, seg=16)
+        a, b = np.array((3.07, 1.43 * s, 0.13)), np.array((3.07, 1.46 * s, 0.13))
+        minifig.cylinder(part('pupil', BLACK, (a + b) / 2), a, b, 0.12, seg=16)
+        a, b = np.array((3.11, 1.46 * s, 0.18)), np.array((3.11, 1.47 * s, 0.18))
+        minifig.cylinder(part('glint', WHITE, (a + b) / 2), a, b, 0.035, seg=8)
+        # an angry brow: a dark slab over the eye, high at the back and dipping toward the snout, cutting the eye's top
+        y0, y1 = 1.36 * s, 1.5 * s
+        (x0, z0), (x1, z1) = (2.74, 0.42), (3.3, 0.22)
+        ring = [(x0, y0, z0), (x1, y0, z1), (x1, y1, z1), (x0, y1, z0),
+                (x0, y0, z0 + 0.1), (x1, y0, z1 + 0.1), (x1, y1, z1 + 0.1), (x0, y1, z0 + 0.1)]
+        minifig.hexa(part('brow', BLACK, np.mean(ring, 0)), ring)
     return out
 
 
+def owl_head(bones, grid):
+    """An owl's face on the owlbear's head bricks, so it doesn't read as a bear: a pale facial disc with big yellow
+    eyes, a hooked beak between them and two ear tufts. On the head bone (OWBBONE43), fitted to the front of its
+    bricks."""
+    lo, size, filled, bone, bone_names = grid
+    he = 'OWBBONE43_DAG'
+    if he not in bone_names:
+        return []
+    cells = np.argwhere(filled & (bone == bone_names.index(he)))
+    if not len(cells):
+        return []
+    front = cells[:, 0].max()
+    face = cells[cells[:, 0] >= front - 1]
+    xf = lo[0] + size * (front + 1)  # the front face of the head bricks
+    y0, y1 = lo[1] + size * face[:, 1].min(), lo[1] + size * (face[:, 1].max() + 1)
+    z0, z1 = lo[2] + size * cells[:, 2].min(), lo[2] + size * (cells[:, 2].max() + 1)
+    W, H = y1 - y0, z1 - z0
+    yc, zc = (y0 + y1) / 2, z0 + 0.6 * H
+    CREAM, YELLOW, BLACK, BEAK, TUFT = (228, 205, 158), (242, 205, 55), (20, 20, 22), (254, 138, 24), (88, 57, 39)
+    out = []
+
+    def part(name, color, a, b, r0, r1=None, seg=20):
+        q = minifig.Part(name, he, None, (a + b) / 2)
+        minifig.cylinder(q, a, b, r0, r1, seg=seg)
+        out.append((q, color))
+
+    X = np.array((1.0, 0, 0))
+    for sgn in (1, -1):
+        c = np.array((xf, yc + sgn * 0.24 * W, zc))
+        part('facial disc', CREAM, c - 0.01 * X, c + 0.03 * X, 0.27 * W)
+        part('eye', YELLOW, c + 0.03 * X, c + 0.06 * X, 0.16 * W)
+        part('pupil', BLACK, c + 0.06 * X, c + 0.08 * X, 0.08 * W)
+        g = c + np.array((0, -sgn * 0.03 * W, 0.05 * W))
+        part('glint', WHITE, g + 0.08 * X, g + 0.09 * X, 0.025 * W, seg=8)
+        # an ear tuft: a dark four-sided spike leaning out from the top corner of the head
+        base = np.array((xf - 0.2 * W, yc + sgn * 0.38 * W, z1 - 0.02 * H))
+        part('ear tuft', TUFT, base, base + np.array((0.05 * W, sgn * 0.12 * W, 0.32 * H)), 0.11 * W, 0.01, seg=4)
+    a = np.array((xf + 0.02, yc, zc - 0.12 * H))
+    part('beak', BEAK, a, a + np.array((0.22 * W, 0, -0.2 * H)), 0.12 * W, 0.01, seg=4)
+    return out
+
+
+def head_bones(bone_names, parents, prefix):
+    """Indices of the head bone(s) (<P>HE..., <P>_HE...) and everything hanging from them (jaw, ears, eyes)."""
+    core = lambda n: n[len(prefix):].lstrip('_')
+    top = {k for k, n in enumerate(bone_names) if core(n).startswith('HE')}
+    out = set(top)
+    for k in range(len(bone_names)):
+        p = parents[k]
+        while p >= 0:
+            if p in top:
+                out.add(k)
+                break
+            p = parents[p]
+    return out
+
+
+def turn_head(P, R):
+    """Head-space points P (rows) and the head bone's rotation R -> (P turned so x = forward, y = left, z = up, the
+    rotation from that turned space to world). Which head axis is left-right: the head is mirror-symmetric across
+    it; which way the snout points: the head reaches further forward of its joint than back."""
+    # Which head axis is left-right (the head is mirror-symmetric across it) and which way the snout points (the
+    # head reaches further forward of its joint than back): turn head space so x = forward, y = left, z = up
+    sub = P[np.random.default_rng(5).choice(len(P), min(len(P), 1500), replace=False)]
+
+    def asym(ax):
+        m = sub.copy()
+        m[:, ax] = 2 * np.median(sub[:, ax]) - m[:, ax]
+        return float(np.sqrt(((m[:, None, :] - sub[None, :, :]) ** 2).sum(-1).min(1)).mean())
+    side_ax = min((0, 1, 2), key=asym)
+    rest = [a for a in (0, 1, 2) if a != side_ax]
+    spans = {a: np.percentile(P[:, a], 95) - np.percentile(P[:, a], 5) for a in rest}
+    up_ax = 2 if 2 in rest else min(rest, key=lambda a: spans[a])  # bones keep z up where they can
+    fwd_ax = next(a for a in rest if a != up_ax)
+    fs = 1.0 if np.percentile(P[:, fwd_ax], 95) >= -np.percentile(P[:, fwd_ax], 5) else -1.0
+    M = np.zeros((3, 3))  # head space -> turned space (rows: forward, left, up)
+    M[0, fwd_ax], M[1, side_ax], M[2, up_ax] = fs, 1.0, 1.0
+    P = P @ M.T
+    return P, R @ M.T
+
+
+def eye_candidates(pts, cols, bns, heads, size, frame=None, jaw=(), top=5):
+    """The stock model's eyes, from its head texture: a mirrored pair (one each side of the head's middle) of small
+    patches whose color stands out from the skin around them, high and toward the front of the head.
+    frame: the head bone's rest (R, T); the search runs in its space, so a head lying sideways (a coiled snake's)
+    still mirrors left to right. -> [(center, color, radius, side)] for the two eyes (world space; side = the
+    world direction the eye looks out, plus the snout's world direction), or [] when the head shows no such pair.
+    jaw: bones (jaw, tongue) whose patches are mouth, never eyes. Returns the best `top` pairs, best first."""
+    sel = np.isin(bns, list(heads))
+    if sel.sum() < 30:
+        return []
+    R, T = (np.eye(3), np.zeros(3)) if frame is None else (np.asarray(frame[0], float), np.asarray(frame[1], float))
+    P, C, B = (pts[sel] - T) @ R, cols[sel], bns[sel]  # into head space
+    P, R = turn_head(P, R)
+    lo, hi = np.percentile(P, 5, 0), np.percentile(P, 95, 0)  # the head's bulk, not its horns and ear tips
+    ext = np.maximum(hi - lo, 1e-6)
+    if len(P) > 8000:  # plenty for finding eyes
+        keep = np.random.default_rng(3).choice(len(P), 8000, replace=False)
+        P, C, B = P[keep], C[keep], B[keep]
+    # local contrast: each point's color against the median color around it (an eye stands out from the skin
+    # right next to it, whether it is darker or lighter than the head as a whole)
+    reach = 0.12 * float(ext.max())
+    diff = np.zeros(len(P), np.float32)
+    for k in range(0, len(P), 500):
+        d2 = ((P[k:k + 500, None, :] - P[None, :, :]) ** 2).sum(-1)
+        for j, row in enumerate(d2):
+            near = C[row < reach * reach]
+            diff[k + j] = np.sqrt(((C[k + j] - np.median(near, 0)) ** 2).sum())
+    cut = max(55.0, float(np.percentile(diff, 96)))
+    cand = np.nonzero((diff > cut) & ~np.isin(B, list(jaw)))[0]
+    if len(cand) < 2:
+        return []
+    cell = float(ext.max()) / 45
+    key = {}
+    for i in cand:
+        key.setdefault(tuple(np.floor((P[i] - lo) / cell).astype(int)), []).append(i)
+    clusters, seen, diff_of = [], set(), {}
+    for k0 in key:  # patches: cells touching one another (26 neighbours)
+        if k0 in seen:
+            continue
+        seen.add(k0)
+        stack, members = [k0], []
+        while stack:
+            k = stack.pop()
+            members += key[k]
+            for d in np.ndindex(3, 3, 3):
+                q = (k[0] + d[0] - 1, k[1] + d[1] - 1, k[2] + d[2] - 1)
+                if q in key and q not in seen:
+                    seen.add(q)
+                    stack.append(q)
+        m = np.array(members)
+        clusters.append((P[m].mean(0), C[m].mean(0), len(m), float((P[m].max(0) - P[m].min(0)).max())))
+        diff_of[id(clusters[-1])] = float(diff[m].mean())
+    mid = (lo[1] + hi[1]) / 2
+    pairs = []
+    for a in clusters:
+        for b in clusters:
+            (ca, cola, na, ea), (cb, colb, nb, eb) = a, b
+            if ca[1] - mid < 0.12 * ext[1] or cb[1] - mid > -0.12 * ext[1]:
+                continue  # one on each side, off the middle (not the mouth or nose)
+            if abs((ca[1] - mid) + (cb[1] - mid)) > 0.2 * ext[1] or abs(ca[0] - cb[0]) > 0.15 * ext[0] \
+                    or abs(ca[2] - cb[2]) > 0.15 * ext[2]:
+                continue  # mirror images
+            if max(ea, eb) > 0.45 * ext.max() or np.sqrt(((cola - colb) ** 2).sum()) > 70:
+                continue  # small, the same color
+            zrel = ((ca[2] + cb[2]) / 2 - lo[2]) / ext[2]
+            xrel = ((ca[0] + cb[0]) / 2 - lo[0]) / ext[0]
+            yrel = (ca[1] - cb[1]) / 2 / ext[1]  # 0.5: on the very sides
+            if zrel < 0.3:
+                continue  # eyes sit high, not the jaw or the feet of a head-only creature
+            # where eyes usually are: high, toward the front, about a third of the way out to the sides
+            prior = math.exp(-((zrel - 0.62) / 0.25) ** 2 - ((xrel - 0.65) / 0.3) ** 2 - ((yrel - 0.33) / 0.18) ** 2)
+            pink = lambda c: c[0] > c[1] + 35 and c[1] > 80  # mouth lining, tongue
+            if pink(cola) or pink(colb):
+                prior *= 0.25
+            sc = math.sqrt(min(na, nb)) * prior * (1 + (diff_of[id(a)] + diff_of[id(b)]) / 200)
+            if min(na, nb) >= 2 and sc >= 0.05:
+                pairs.append((sc, a, b))
+    out, used = [], set()
+    for sc, a, b in sorted(pairs, key=lambda q: -q[0]):
+        if id(a) in used or id(b) in used:
+            continue
+        used |= {id(a), id(b)}
+        out.append([(R @ c + T, col, max(e / 2, size * 0.36), R @ np.array((0.0, 1.0 if c[1] > mid else -1.0, 0.0)),
+                     R @ np.array((1.0, 0.0, 0.0))) for c, col, _n, e in (a, b)])
+        if len(out) == top:
+            break
+    return out
+
+
+def head_eye_candidates(w, bones, mesh_ids, textures, prefix, size, top=5):
+    """eye_candidates for a creature: its head bones sampled finely."""
+    bone_names = [n for n, _p, _w in bones]
+    heads = head_bones(bone_names, [p for _n, p, _w in bones], prefix)
+    if not heads:
+        return []
+    hp = sample_surface(w, bones, mesh_ids, textures, step=1.0, only=heads)[0]
+    if not len(hp):
+        return []
+    fine = float((hp.max(0) - hp.min(0)).max()) / 60
+    hp, hc, hb = sample_surface(w, bones, mesh_ids, textures, step=min(size / 3, fine), only=heads)
+    he = min(heads)  # the head bone itself comes before what hangs from it
+    frame = (np.array(bones[he][2][0], float), np.array(bones[he][2][1], float))
+    jaw = {k for k in heads if bone_names[k][len(prefix):].lstrip('_').startswith(('JA', 'TO', 'TN', 'TE', 'MO'))}
+    return eye_candidates(hp, hc, hb, heads, size, frame, jaw, top)
+
+
+# Eyes picked by hand from the candidates (scripts/eyes.py): prefix -> the two eyes, or null for a creature whose
+# stock head shows no eyes (or keeps them some other way). Creatures not listed get no eyes.
+_eyes_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'creature_eyes.json')
+EYE_PICKS = json.load(open(_eyes_file)) if os.path.exists(_eyes_file) else {}
+
+
+def shaped_eyes(w, bones, mesh_ids, textures, prefix, size, where='front', color=WHITE):
+    """Two eyes placed by the head's shape, for heads whose painted eyes don't stand out from the texture: high on
+    the face (where='front', looking forward) or on the sides of the head (where='side', a horse's or a fish's),
+    in the given color. -> [(center, color, radius, look, forward)] like eye_candidates, or []."""
+    bone_names = [n for n, _p, _w in bones]
+    heads = head_bones(bone_names, [p for _n, p, _w in bones], prefix)
+    if not heads:
+        return []
+    pts = sample_surface(w, bones, mesh_ids, textures, step=1.0, only=heads)[0]
+    if len(pts) < 10:
+        return []
+    pts = sample_surface(w, bones, mesh_ids, textures, step=float((pts.max(0) - pts.min(0)).max()) / 60, only=heads)[0]
+    he = min(heads)
+    R, T = np.array(bones[he][2][0], float), np.array(bones[he][2][1], float)
+    P, R = turn_head((pts - T) @ R, R)
+    lo, hi = np.percentile(P, 5, 0), np.percentile(P, 95, 0)
+    ext = np.maximum(hi - lo, 1e-6)
+    mid = (lo + hi) / 2
+    out = []
+    for s in (1, -1):
+        if where == 'side':
+            tx, tz = lo[0] + 0.68 * ext[0], lo[2] + 0.66 * ext[2]
+            near = np.nonzero((np.abs(P[:, 0] - tx) < 0.08 * ext[0]) & (np.abs(P[:, 2] - tz) < 0.08 * ext[2])
+                              & (s * (P[:, 1] - mid[1]) > 0))[0]
+            if not len(near):
+                return []
+            c = P[near[np.argmax(s * P[near, 1])]]
+            look = np.array((0.0, s, 0.0))
+        else:
+            ty, tz = mid[1] + s * 0.22 * ext[1], lo[2] + 0.64 * ext[2]
+            near = np.nonzero((np.abs(P[:, 1] - ty) < 0.07 * ext[1]) & (np.abs(P[:, 2] - tz) < 0.07 * ext[2]))[0]
+            if not len(near):
+                return []
+            c = P[near[np.argmax(P[near, 0])]]
+            look = np.array((1.0, 0.0, 0.0))
+        out.append((R @ c + T, np.array(color, float), max(0.07 * float(ext.max()), size * 0.36), R @ look,
+                    R @ np.array((1.0, 0.0, 0.0))))
+    return out
+
+
+EYE_COLORS = {'white': WHITE, 'red': (201, 26, 9), 'yellow': (242, 205, 55), 'green': (75, 151, 74),
+              'blue': (90, 147, 219), 'orange': (254, 138, 24)}
+
+
+def picked_eyes(prefix, w=None, bones=None, mesh_ids=None, textures=None, size=None):
+    """[(center, color, radius, look, forward)] for the two picked eyes, or []. A pick is two candidate eyes, or
+    {'shape': 'front'|'side', 'color': name} for eyes placed by the head's shape."""
+    pick = EYE_PICKS.get(prefix)
+    if not pick:
+        return []
+    if isinstance(pick, dict):
+        return shaped_eyes(w, bones, mesh_ids, textures, prefix, size, pick.get('shape', 'front'),
+                           EYE_COLORS[pick.get('color', 'white')]) if w is not None else []
+    return [tuple(np.array(v, float) if k != 2 else float(v) for k, v in enumerate(e)) for e in pick]
+
+
+def brick_eyes(eyes, lo, size, filled, bone, bone_names, heads):
+    """An eye on the bricks at each stock eye: a disc in the eye's color with a dark pupil (a dark eye gets a white
+    disc and a black pupil) and a glint, flat on the face of the head cubes it looks out of. -> [(Part, rgb)]."""
+    BLACK = (20, 20, 22)
+    dims = filled.shape
+    out = []
+    for c, col, r, look, forward in eyes:
+        side = np.zeros(3)
+        ax = int(np.argmax(np.abs(look)))
+        side[ax] = np.sign(look[ax])  # the eye sits on the cube face nearest the way it looks
+        cell = np.floor((c - lo) / size).astype(int)
+        # look out of the head along the side axis; the eye goes on the outer face of the last head cube
+        best = None
+        for d in (side,):
+            k = cell.copy()
+            ax = int(np.nonzero(d)[0][0])
+            step = int(d[ax])
+            last = None
+            for _ in range(dims[ax] + 2):
+                if all(0 <= k[i] < dims[i] for i in range(3)) and filled[tuple(k)]:
+                    last = k.copy()
+                elif last is not None:
+                    break
+                k[ax] += step
+            if last is None:  # the eye point is outside the bricks: walk back in
+                k = cell.copy()
+                for _ in range(dims[ax] + 2):
+                    k[ax] -= step
+                    if all(0 <= k[i] < dims[i] for i in range(3)) and filled[tuple(k)]:
+                        last = k.copy()
+                        break
+            if last is not None:
+                best = (last, d, ax, step)
+        if best is None:
+            continue
+        last, d, ax, step = best
+        fwd = np.asarray(forward, float) - d * np.dot(forward, d)  # the snout's way, along the face
+        fwd = fwd / (np.linalg.norm(fwd) or 1)
+        plane = lo[ax] + size * (last[ax] + (1 if step > 0 else 0))
+        r = min(r, size * 0.8)
+        base = c.copy()
+        base[ax] = plane
+        dark = float(np.dot(col, (0.3, 0.59, 0.11))) < 70 and float(np.max(col) - np.min(col)) < 40  # not a red glow
+        iris = WHITE if dark else tuple(int(v) for v in nearest(boost(np.array([col], np.float32)))[0])
+        bname = bone_names[bone[tuple(last)]]
+        t = size * 0.05
+        for name, rgb, rad, h0, h1, shift in (('eye', iris, r, -0.01, 1, 0.0), ('pupil', BLACK, r * (0.55 if dark else 0.45), 1, 1.6, 0.12),
+                                               ('glint', WHITE, r * 0.16, 1.6, 1.9, 0.4)):
+            a, b = base + d * t * h0, base + d * t * h1
+            if shift:  # pupil a little forward (toward the snout), glint up and forward
+                nudge = shift * r * (0.6 * fwd + (np.array((0, 0, 1.0)) if name == 'glint' else 0))
+                a, b = a + nudge, b + nudge
+            p = minifig.Part(name, bname, None, (a + b) / 2)
+            minifig.cylinder(p, a, b, rad, seg=16 if name != 'glint' else 8)
+            out.append((p, rgb))
+    return out
+
+
+# Creatures that keep their own eyes: sculpted heads, painted faces, the shark's cartoon eyes
+NO_EYES = set()
+
+
+# More main colors for creatures whose small bright trim (gold pads, a colored sash) gets lost among five
+NCOLORS = {'SHM': 8}
+VIVID = {'SHM': 10}  # how much more a brightly colored cube counts when picking them
+
+
 # Extra built parts on a creature, after bricking: prefix -> f(bones) giving [(Part, rgb)].
-EXTRAS = {'SHA': shark_lasers}
+EXTRAS = {'SHA': shark_lasers, 'OWB': owl_head}
+
+
+# Creatures with no body to brick, built as a pair of floating eyes on the head bone: prefix -> eye color.
+# IVM (the invisible man) has an old 0x2C mesh; its new body is a 0x36 mesh in the same fragment slot.
+FLOATING_EYES = {'IVM': (201, 26, 9)}
+
+
+def floating_eyes(w, sid, color):
+    """Two glowing eyes where the head is, and nothing else: a disc in the color with a bright center and a glint,
+    looking forward (+x), on the head bone so they bob with the walk. -> a build_creature-style dict."""
+    bones, mesh_ids = w.skeleton(sid)
+    prefix = w.frags[sid][1].split('_')[0]
+    frame = {n: np.array(T, float) for n, _p, (_R, T) in bones}
+    he, top = f'{prefix}HE_DAG', f'{prefix}HEAD_POINT_DAG'
+    if he not in frame or not mesh_ids:
+        return None
+    hz = frame[he][2] + 0.45 * ((frame[top][2] if top in frame else frame[he][2] + 0.5) - frame[he][2])
+    hx = max(frame[he][0], frame[top][0] if top in frame else frame[he][0]) + 0.02
+    hot = tuple(min(255, int(c * 0.4 + 255 * 0.6)) for c in color)
+    out = []
+    for s in (1, -1):
+        y = 0.13 * s
+        for name, rgb, rad, x0, x1, dz in (('eye', color, 0.075, hx, hx + 0.04, 0.0),
+                                           ('eye core', hot, 0.035, hx + 0.04, hx + 0.05, 0.0),
+                                           ('glint', WHITE, 0.014, hx + 0.05, hx + 0.055, 0.03)):
+            a, b = np.array((x0, y, hz + dz)), np.array((x1, y, hz + dz))
+            q = minifig.Part(name, he, None, (a + b) / 2)
+            minifig.cylinder(q, a, b, rad, seg=16 if name != 'glint' else 8)
+            out.append((q, rgb))
+    classes = {}
+    for q, rgb in out:
+        q.material = fake(classes.setdefault(tuple(rgb), len(classes)))
+    classes = list(classes)
+    imgs, pos = class_atlases(classes, 1)
+    parts = [q for q, _r in out]
+    previews = []
+    pp = []
+    for q in parts:
+        r = copy.copy(q)
+        r.material = classes[unfake(q.material)][0:3]
+        pp.append(r)
+    previews.append((0, None, pp))
+    body = mesh_ids[0]
+    donor = next(b for t, _n, b in w.frags[1:] if t == 0x36)
+    old = w.frags[body][2]
+    head = bytearray(donor[:96])
+    head[0:4] = old[0:4]  # its own name
+    mlist = struct.unpack_from('<i', old, 36 if w.frags[body][0] == 0x2C else 8)[0]  # 0x2C: after its 8 counts
+    struct.pack_into('<i3i', head, 8, mlist, 0, 0, 0)
+    materials = [w.material(k)[0] for k in w.material_list(mlist)]
+    return dict(prefix=prefix, bones=bones, parts=parts, body=body, cubes=0, size=0.0, glass=0, anchored=0,
+                eyes=2, atlases={0: imgs[0]}, uvmap=lambda material, u, v: pos[unfake(material)], previews=previews,
+                classes=len(classes), header=bytes(head), materials=materials)
 
 
 def build_creature(w, sid, textures, voxels, ncolors=5):
@@ -929,6 +1471,9 @@ def build_creature(w, sid, textures, voxels, ncolors=5):
     glass_mat = GLASS.get(prefix)
     pts, cols, bns, *g = sample_surface(w, bones, mesh_ids, textures, step=size / 3, glass=glass_mat)
     lo, filled, color, bone = voxelize(pts, cols, bns, size)
+    anchored = anchor_limbs(filled, bone, [p for _n, p, _w in bones], color)
+    if prefix in PIVOT_BRIDGE:
+        anchored += pivot_bridge(filled, bone, color, bones, lo, size)
     glass = np.zeros(filled.shape, bool)
     if glass_mat:  # cubes whose samples are mostly on the translucent material
         idx = np.floor((pts - lo) / size).astype(int)
@@ -941,7 +1486,7 @@ def build_creature(w, sid, textures, voxels, ncolors=5):
     schemes = []  # per variant: the colors of a sculpted head
 
     def finish(grid):
-        snapped = palette_colors(grid, filled, ncolors, FIXED_COLORS.get(prefix))
+        snapped = palette_colors(grid, filled, ncolors, FIXED_COLORS.get(prefix), VIVID.get(prefix, 1))
         snapped = smooth_colors(filled, snapped)
         if prefix in HEADS:
             schemes.append(HEADS[prefix][0](filled, snapped))
@@ -969,7 +1514,14 @@ def build_creature(w, sid, textures, voxels, ncolors=5):
         filled = filled & ~np.isin(bone, on)
         for p, role in head:
             p.material = fake(classes.setdefault(tuple(c for s in schemes for c in s[role]), len(classes)))
-    extra = EXTRAS[prefix](bones) if prefix in EXTRAS else []
+    extra = EXTRAS[prefix](bones, (lo, size, filled, bone, bone_names)) if prefix in EXTRAS else []
+    eyes = []
+    if prefix not in HEADS and prefix not in VOXEL_FACES and prefix not in EXTRAS and prefix not in NO_EYES:
+        heads = head_bones(bone_names, [p for _n, p, _w in bones], prefix)
+        spots = picked_eyes(prefix, w, bones, mesh_ids, textures, size)
+        if spots:
+            eyes = brick_eyes(spots, lo, size, filled, bone, bone_names, heads)
+            extra += eyes
     for p, rgb in extra:  # the same color in every texture variant
         p.material = fake(classes.setdefault(tuple(rgb) * len(vlist), len(classes)))
     classes = list(classes)
@@ -989,6 +1541,7 @@ def build_creature(w, sid, textures, voxels, ncolors=5):
         previews.append((v, None, pp))
     body = body_mesh(w, prefix, mesh_ids)
     return dict(prefix=prefix, bones=bones, parts=parts, body=body, cubes=int(filled.sum()), size=size, glass=int(glass.sum()),
+                anchored=anchored, eyes=len(eyes) // 3,
                 atlases=dict(zip(vlist, imgs)), uvmap=uvmap, previews=previews, classes=len(classes))
 
 
@@ -1010,7 +1563,7 @@ def main():
             creatures.append(build_person(w, sid, textures))
         else:
             try:
-                c = build_creature(w, sid, textures, VOXELS.get(prefix, voxels))
+                c = floating_eyes(w, sid, FLOATING_EYES[prefix]) if prefix in FLOATING_EYES else                     build_creature(w, sid, textures, VOXELS.get(prefix, voxels), NCOLORS.get(prefix, 5))
             except (OverflowError, struct.error, IndexError) as e:  # a malformed mesh (IVM in global_chr)
                 print(f'{prefix}: unreadable mesh ({type(e).__name__}), left as it was')
                 c = None
@@ -1027,6 +1580,12 @@ def main():
         if i in bodies:
             c = bodies[i]
             uvmap = c['uvmap']
+            if c.get('header'):  # a new 0x36 body in an old mesh's place
+                ftype = 0x36
+                raw = make_s3d.mesh_body(w, i, c['parts'], c['bones'], uvmap, c['materials'][0], c['header'],
+                                         c['materials'])
+                frags.append((ftype, raw))
+                continue
             mats = w.mesh(i)['materials']
             mat = variant_material(mats, textures, c['prefix'])
             if c.get('glass'):  # glass bricks on the translucent material, the rest on the body's
@@ -1076,7 +1635,7 @@ def main():
         nv = len(c['previews'])
         print(f"{c['prefix']}: " + (f"minifig {c['look']}" if 'look' in c else
                                     f"{c['cubes']} bricks of {c['size']:.2f}, {c['classes']} color classes")
-              + (f', {nv} variants' if nv > 1 else ''))
+              + (f', {nv} variants' if nv > 1 else '') + (f", {c['eyes']} eyes" if c.get('eyes') else ''))
     print(f'{len(out)} files -> {dst}')
 
 
