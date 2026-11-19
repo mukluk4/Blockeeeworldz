@@ -9,11 +9,18 @@ spare parts) becomes one hidden triangle. Texture names are global in the client
 of the variant table (.lay) points at the creature's own new textures c_<code>_brick_c.dds / _n.dds instead of
 painting over shared names. All texture variants show the first variant's colors (variants come later).
 
-    python -I eqgcreature.py <client folder> <out folder> <zone> [zone ...]
+    python -I eqgcreature.py <client folder> <out folder> <zone> [zone ...] [--global] [--read-only]
+    python -I eqgcreature.py --archive <archive.eqg> <out.eqg> code[,code...]
 
-Models come from each zone's <zone>_chr.txt (lines "model,archive"); .s3d archives there are brickcreature.py's job.
-Archives are read from <client>/brick_orig/<archive>.eqg.orig when it exists, else the client copy is backed up there
-first.
+Models come from each zone's <zone>_chr.txt (lines "model,archive"), and with --global also from the client's
+Resources/GlobalLoad_chr.txt; .s3d archives there are brickcreature.py's job. Archives are read from
+<client>/brick_orig/<archive>.eqg.orig when it exists, else the client copy is backed up there first (never with
+--read-only). --archive bricks the named models of one archive (scripts/review_eqg.py uses it).
+
+Like brickcreature.py: stray clumps of bricks follow the limb they touch and floating limbs get a short bridge to
+their parent (anchor_limbs), and the head gets built eyes where the stock texture shows a pair (best candidate, or
+the hand pick in creature_eyes.json under "eqg:<code>"; null there means none). Distance models (<code>_lod1.mod...)
+get the same bricks, so a creature doesn't turn back into its stock self far away.
 """
 import math, os, re, shutil, struct, sys
 import numpy as np
@@ -23,7 +30,7 @@ _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [os.path.join(_root, d) for d in ('lib', 'characters', 'zones')]
 import io
 import brickcreature as bc
-import eqgmds, eqgmod, make_s3d, minifig, pfs
+import eqgbones, eqgmds, eqgmod, make_s3d, minifig, pfs
 
 VOXELS = 18
 SKIP = set()
@@ -59,13 +66,16 @@ def meshes(m, kind):
     return [(p['verts'], p['tris'], p['weights']) for p in drawn]
 
 
-def sample_points(m, kind, texs, step):
+def sample_points(m, kind, texs, step, only=None):
+    """Surface points, their texture colors and the bone each rides. only: bones whose triangles alone are sampled."""
     pts, cols, bns = [], [], []
     for verts, tris, weights in meshes(m, kind):
         P = np.array([v[0] for v in verts], float)
         UV = np.array([v[3] for v in verts], float)
         top = [max(w[1][:max(1, w[0])], key=lambda bw: bw[1])[0] for w in weights] if weights else [0] * len(verts)
         for a, b, c, mat, _fl in tris:
+            if only is not None and not {top[a], top[b], top[c]} & only:
+                continue
             img = texs[mat] if 0 <= mat < len(texs) else None
             A, B, Cc = P[a], P[b], P[c]
             n = max(1, int(math.ceil(max(np.linalg.norm(B - A), np.linalg.norm(Cc - A), np.linalg.norm(Cc - B)) / step)))
@@ -84,7 +94,7 @@ def sample_points(m, kind, texs, step):
     return np.array(pts, float), np.array(cols, np.float32), np.array(bns, int)
 
 
-def brick_model(m, kind, files, voxels=VOXELS, ncolors=5, sculpt=None):
+def brick_model(m, kind, files, voxels=VOXELS, ncolors=5, sculpt=None, pick=None):
     """The bricks for one model: (parts, atlas image, uvmap, bricks, brick size), or None without a surface.
     sculpt(head points, head bone, jaw bone) -> (colors by role, [(Part, role)]) replaces the voxel head (the drawn
     HE piece of an .mds) with a sculpted one."""
@@ -96,6 +106,8 @@ def brick_model(m, kind, files, voxels=VOXELS, ncolors=5, sculpt=None):
     size = max(min(ext[2] / voxels, ext[1] / 5), 0.05)
     pts, cols, bns = sample_points(m, kind, texs, step=size / 3)
     lo, filled, color, bone = bc.voxelize(pts, cols, bns, size)
+    parent = eqgbones.parents(m.bones) if m.bones else [-1]
+    anchored = bc.anchor_limbs(filled, bone, parent, color)
     snapped = bc.smooth_colors(filled, bc.palette_colors(color, filled, ncolors))
     classes, cls = {}, np.zeros(color.shape, np.float32)
     for x, y, z in zip(*np.nonzero(filled)):
@@ -119,12 +131,65 @@ def brick_model(m, kind, files, voxels=VOXELS, ncolors=5, sculpt=None):
             for p, role in parts_h:
                 p.material = bc.fake(classes.setdefault(scheme[role], len(classes)))
             head = [p for p, _r in parts_h]
-    parts = bc.build_parts(lo, size, filled, cls, bone, names) + head
+    extra = []
+    if not head and m.bones and pick is not False:
+        spots = pick or auto_eyes(m, kind, texs, parent, size)
+        if spots:
+            heads = head_set(m, parent)
+            extra = bc.brick_eyes(spots, lo, size, filled, bone, names, heads)
+    for p, rgb in extra:
+        p.material = bc.fake(classes.setdefault(tuple(int(v) for v in rgb), len(classes)))
+    parts = bc.build_parts(lo, size, filled, cls, bone, names) + head + [p for p, _r in extra]
     imgs, pos = bc.class_atlases(list(classes), 1)
     uvmap = lambda material, u, v: pos[bc.unfake(material)]
     for p in parts:  # preview colors
         p.color = list(classes)[bc.unfake(p.material)]
-    return parts, imgs[0], uvmap, int(filled.sum()), size
+    return parts, imgs[0], uvmap, int(filled.sum()), size, dict(classes=len(classes), anchored=anchored,
+                                                                eyes=len(extra) // 3)
+
+
+def head_set(m, parent):
+    """Indices of the head bone(s) (HEAD...) and everything hanging from them (jaw, ears)."""
+    names = [eqgmds.name(m, b[0]) for b in m.bones]
+    top = {k for k, n in enumerate(names) if n.upper().startswith('HEAD')}
+    out = set(top)
+    for k in range(len(names)):
+        p = parent[k]
+        while p >= 0:
+            if p in top:
+                out.add(k)
+                break
+            p = parent[p]
+    return out
+
+
+def auto_eyes(m, kind, texs, parent, size):
+    """The best eye pair the stock head texture shows (brickcreature.eye_candidates), or []."""
+    heads = head_set(m, parent)
+    if not heads:
+        return []
+    names = [eqgmds.name(m, b[0]) for b in m.bones]
+    hp = sample_points(m, kind, texs, 1.0, only=heads)[0]
+    if len(hp) < 10:
+        return []
+    fine = float((hp.max(0) - hp.min(0)).max()) / 60
+    hp, hc, hb = sample_points(m, kind, texs, min(size / 3, fine), only=heads)
+    rest = eqgbones.world(m.bones, parent)
+    he = min(k for k in heads if names[k].upper().startswith('HEAD'))
+    jaw = {k for k in heads if names[k].upper().startswith(('JAW', 'TONG', 'TEETH', 'MOUTH'))}
+    found = bc.eye_candidates(hp, hc, hb, heads, size, rest[he], jaw, 1)
+    return found[0] if found else []
+
+
+def eye_pick(code):
+    """The hand pick for this model: a list of two eyes, False for none, None when not picked."""
+    key = f'eqg:{code.lower()}'
+    if key not in bc.EYE_PICKS:
+        return None
+    v = bc.EYE_PICKS[key]
+    if not v or isinstance(v, dict):  # null: no eyes (shaped eyes are for .s3d heads only)
+        return False
+    return [tuple(np.array(x, float) if k != 2 else float(x) for k, x in enumerate(e)) for e in v]
 
 
 HEADS = {'MYG': bc.squid_head, 'AMY': bc.squid_head}
@@ -220,11 +285,12 @@ def build_archive(src, dst, codes, preview=None):
             continue
         lib = eqgmds if kind == 'mds' else eqgmod
         m = lib.read(fd[f'{code}.{kind}'])
-        built = brick_model(m, kind, fd, bc.VOXELS.get(code.upper(), VOXELS), sculpt=HEADS.get(code.upper()))
+        built = brick_model(m, kind, fd, bc.VOXELS.get(code.upper(), VOXELS), sculpt=HEADS.get(code.upper()),
+                            pick=eye_pick(code))
         if built is None:
             report.append(f'{code}: no surface, left as it was')
             continue
-        parts, atlas, uvmap, nb, size = built
+        parts, atlas, uvmap, nb, size, info = built
         verts, tris, weights = geometry(parts, uvmap, bool(m.bones))
         if kind == 'mod':
             m.verts, m.tris, m.weights = verts, tris, weights
@@ -242,6 +308,12 @@ def build_archive(src, dst, codes, preview=None):
         diffuse, normal = own_textures(m, code)
         name = next(n for n, _b in files if n.lower() == f'{code}.{kind}')
         out_files[name] = lib.write(m)
+        lods = []
+        if kind == 'mod':  # distance models: the same bricks (animations find the bones by name)
+            for n, _b in files:
+                if re.fullmatch(re.escape(code) + r'_lod\d+\.mod', n.lower()):
+                    out_files[n] = out_files[name]
+                    lods.append(n)
         lay = next((n for n, _b in files if n.lower() == f'{code}.lay'), None)
         if lay:
             out_files[lay] = own_layers(out_files[lay], diffuse, normal)
@@ -254,35 +326,52 @@ def build_archive(src, dst, codes, preview=None):
                 q.tris = p.tris
                 pp.append(q)
             minifig.preview(f'{preview}_{code}.png', pp, size=320, ss=1)
-        report.append(f'{code}: {kind}, {nb} bricks of {size:.2f}')
+        report.append(f'{code}: {nb} bricks of {size:.3f}, {info["classes"]} color classes ({kind}, '
+                      f'{info["anchored"]} cubes anchored, {info["eyes"]} eyes, {len(lods)} distance models)')
     out = [(n, b) for n, b in out_files.items()] + [(n, b) for n, b in extra.items() if n.lower() not in fd]
     pfs.write(dst, out)
     return report
 
 
+def chr_models(path, client):
+    out = []
+    for line in open(path, errors='ignore').read().splitlines()[1:]:
+        if ',' in line:
+            code, arch = (s.strip().lower() for s in line.split(',')[:2])
+            if code.upper() not in SKIP and os.path.exists(os.path.join(client, arch + '.eqg')):
+                out.append((code, arch))
+    return out
+
+
 def main():
-    client, out = sys.argv[1:3]
-    zones = sys.argv[3:]
+    args = sys.argv[1:]
+    if args and args[0] == '--archive':  # one archive: --archive <src.eqg> <dst.eqg> code,code
+        src, dst, codes = args[1:4]
+        for line in build_archive(src, dst, codes.split(',')):
+            print(line, flush=True)
+        return
+    read_only, use_global = '--read-only' in args, '--global' in args
+    args = [x for x in args if x not in ('--read-only', '--global')]
+    client, out = args[:2]
+    lists = [os.path.join(client, f'{z}_chr.txt') for z in args[2:]]
+    if use_global:
+        lists.append(os.path.join(client, 'Resources', 'GlobalLoad_chr.txt'))
     os.makedirs(out, exist_ok=True)
     by_archive = {}
-    for z in zones:
-        path = os.path.join(client, f'{z}_chr.txt')
-        for line in open(path, errors='ignore').read().splitlines()[1:]:
-            if ',' not in line:
-                continue
-            code, arch = (s.strip().lower() for s in line.split(',')[:2])
-            if code.upper() in SKIP or not os.path.exists(os.path.join(client, arch + '.eqg')):
-                continue
-            by_archive.setdefault(arch, set()).add(code)
+    for path in lists:
+        if os.path.exists(path):
+            for code, arch in chr_models(path, client):
+                by_archive.setdefault(arch, set()).add(code)
     failed = []
     for arch, codes in sorted(by_archive.items()):
         name = arch + '.eqg'
         orig = os.path.join(client, 'brick_orig', name + '.orig')
-        if not os.path.exists(orig):
-            shutil.copy2(os.path.join(client, name), orig)
+        src = orig if os.path.exists(orig) else os.path.join(client, name)
+        if not read_only and not os.path.exists(orig):
+            shutil.copy2(src, orig)
+            src = orig
         try:
-            rep = build_archive(orig, os.path.join(out, name), sorted(codes),
-                                preview=os.path.join(out, arch))
+            rep = build_archive(src, os.path.join(out, name), sorted(codes), preview=os.path.join(out, arch))
             print(f'{name}: ' + '; '.join(rep), flush=True)
         except Exception as e:
             failed.append(name)

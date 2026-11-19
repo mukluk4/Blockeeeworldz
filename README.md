@@ -123,6 +123,17 @@ creature's flags: `not built`, `apart in motion` (a limb's bricks pull away from
 point at likely problems; the pictures are for judging the look. `build --only` rebuilds every creature in the
 archives it touches, so shared archives stay whole.
 
+Creatures in newer `.eqg` models have their own run, with the same pictures and flags (`output/review_eqg`):
+
+```
+python -I scripts/review_eqg.py all <client folder> -j 4   # every .eqg creature of the bricked zones and the global list
+```
+
+It bricks each with `eqgcreature.py --archive` (each such creature has its own archive, so the built archives are
+also the full set for a client), and draws it from its own bones and `.ani` walk. `eqgcreature.py` now anchors limbs
+like `brickcreature.py`, gives each head the best eye pair its texture shows (or the pick under `eqg:<code>` in
+`creature_eyes.json`), and puts the same bricks in the distance models (`<code>_lod1.mod`...).
+
 ### Eyes
 
 Small painted eyes get lost when a head becomes a few bricks, so brick creatures get built eyes: a disc in the stock
