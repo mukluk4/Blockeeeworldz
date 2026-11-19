@@ -120,6 +120,7 @@ class Model:
         self.names = [lib.name(m, b[0]) for b in m.bones] or ['ROOT']
         self.bone_list = m.bones or [[0, -1, 0, -1, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)]]
         self.parent = eqgbones.parents(self.bone_list)
+        self.kin = eqgbones.helper_kin(self.parent)
         self.rest = eqgbones.world(self.bone_list, self.parent)
         self.textures = snapshot.textures_of(fd)
         mats = []

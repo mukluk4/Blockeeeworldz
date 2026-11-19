@@ -29,6 +29,25 @@ def parents(bones):
     return out
 
 
+def helper_kin(parent):
+    """{bone: bones that count as its ancestors too}: the leaf children of each ancestor. Rigid-part skeletons (SWC)
+    hang every visible piece on a leaf helper (LEGL_CF_ROT on LEGL_CALF), so a foot's bricks touching the calf's
+    helper are on the leg even though LEGL_CALF itself has none."""
+    kids = {}
+    for k, p in enumerate(parent):
+        kids.setdefault(p, []).append(k)
+    leaf = {p: {c for c in cs if c not in kids} for p, cs in kids.items()}
+    out = {}
+    for k in range(len(parent)):
+        extra, p = set(), parent[k]
+        while p >= 0:
+            extra |= leaf.get(p, set())
+            p = parent[p]
+        extra.discard(k)
+        out[k] = extra
+    return out
+
+
 def world(bones, parent, local=None):
     """[(R, T)] per bone in model space. local: {bone index: (position, rotation)} overriding the rest pose."""
     out = [None] * len(bones)

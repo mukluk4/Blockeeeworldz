@@ -172,13 +172,14 @@ def voxelize(pts, cols, bns, size):
 NEIGHBOURS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
 
 
-def anchor_limbs(filled, bone, parents, color=None, rounds=8, reach=6):
+def anchor_limbs(filled, bone, parents, color=None, rounds=8, reach=6, kin=None):
     """Every clump of cubes on a bone should touch cubes on one of that bone's ancestors, or it floats off the body
     when the creature moves (a wing tip or toe whose cubes all fell next to a sibling bone's). A stray clump that
     touches no ancestor goes onto the bone it touches most, so it moves with what it is attached to. A bone's main
     (largest) clump stays on its bone, so the limb keeps moving; if it floats, a short bridge of cubes (at most
     `reach` long) joins it to its nearest ancestor cube. Clumps with nothing near them (pieces that float in the
-    stock model too) are left alone. Changes filled/bone/color in place; returns cubes moved or added."""
+    stock model too) are left alone. kin: {bone: other bones that count as its ancestors} (eqgcreature.helper_kin).
+    Changes filled/bone/color in place; returns cubes moved or added."""
     dims = filled.shape
     anc = []
     for b in range(len(parents)):
@@ -186,7 +187,7 @@ def anchor_limbs(filled, bone, parents, color=None, rounds=8, reach=6):
         while p >= 0:
             a.add(p)
             p = parents[p]
-        anc.append(a)
+        anc.append(a | (kin or {}).get(b, set()))
     moved = 0
     used = set(bone[filled].tolist())
     has_anc = [bool(a & used) for a in anc]  # a bone none of whose ancestors has bricks floats on nothing

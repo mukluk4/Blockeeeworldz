@@ -94,24 +94,156 @@ def sample_points(m, kind, texs, step, only=None):
     return np.array(pts, float), np.array(cols, np.float32), np.array(bns, int)
 
 
-def brick_model(m, kind, files, voxels=VOXELS, ncolors=5, sculpt=None, pick=None):
+def metal(rgb):
+    """Browns and tans as toy metal: greys by lightness (review 2026-11-19, SWC)."""
+    r, g, b = rgb
+    if max(rgb) - min(rgb) < 25:  # already grey
+        return rgb
+    lum = 0.3 * r + 0.59 * g + 0.11 * b
+    return (27, 42, 52) if lum < 45 else (99, 95, 98) if lum < 95 else (137, 135, 136) if lum < 150 else (160, 165, 169)
+
+
+def gold(rgb):
+    """Greys as gold, by lightness (review 2026-11-19, ROB); colored cubes stay."""
+    r, g, b = rgb
+    if max(rgb) - min(rgb) >= 25:
+        return rgb
+    lum = (r + g + b) / 3
+    return (124, 92, 70) if lum < 60 else (170, 127, 46) if lum < 140 else (220, 188, 129)
+
+
+RECOLOR = {'ROB': gold, 'SWC': metal}
+# Painted details on the front (+x) cubes: (height as a share of the model, radius in cubes, color).
+FRONT_DOT = {'CNP': (0.55, 1, (53, 33, 21), True)}  # the satchel's clasp, a ring
+# Creatures whose limbs get a path of bricks in to their joint, so they turn around it (bc.pivot_bridge).
+PIVOT = {'SWC'}
+# Models built from another creature's stock surface: (archive, creature, translucent material index here).
+# The newer portal looks like the Rift Portal in The Void (the classic BoT portal, its window in fire glass).
+SURFACE_FROM = {'PRT': ('bothunder_chr.s3d', 'BTP', 1)}
+
+
+def borrowed_surface(client, archive, prefix, step):
+    """(points, colors, glass flags) on another creature's stock .s3d surface, or None."""
+    import wld
+    path = next((p for p in (os.path.join(client, 'brick_orig', archive + '.orig'), os.path.join(client, archive))
+                 if os.path.exists(p)), None)
+    if not path:
+        return None
+    files = pfs.read(path)
+    w = wld.Wld(next(b for n, b in files if n.endswith('.wld')))
+    textures = bc.texture_images(files)
+    for sid, _f in w.of_type(0x10):
+        if w.frags[sid][1].split('_')[0] == prefix:
+            bones, mesh_ids = w.skeleton(sid)
+            pts, cols, _b, glass = bc.sample_surface(w, bones, mesh_ids, textures, step, glass=bc.GLASS.get(prefix))
+            return pts, cols, glass
+    return None
+
+
+def drop_crumbs(filled, bone, parent, kin, most=2, near=3):
+    """Remove clumps of at most `most` cubes that are more than `near` cells from every cube of their bone's
+    ancestors (a lone cape-hem cube anchor_limbs could not bridge: MYG). -> cubes removed."""
+    removed = 0
+    for b in set(bone[filled].tolist()):
+        anc, p = set(kin.get(b, set())), parent[b] if 0 <= b < len(parent) else -1
+        while p >= 0:
+            anc.add(p)
+            p = parent[p]
+        mine = np.argwhere(filled & (bone == b))
+        others = np.argwhere(filled & np.isin(bone, list(anc))) if anc else np.zeros((0, 3), int)
+        if not len(others) or len(mine) > 40:
+            continue
+        left = {tuple(c) for c in mine}
+        while left:  # face-connected clumps of this bone
+            start = left.pop()
+            clump, stack = [start], [start]
+            while stack:
+                x, y, z = stack.pop()
+                for q in ((x + 1, y, z), (x - 1, y, z), (x, y + 1, z), (x, y - 1, z), (x, y, z + 1), (x, y, z - 1)):
+                    if q in left:
+                        left.discard(q)
+                        clump.append(q)
+                        stack.append(q)
+            if len(clump) <= most and np.abs(np.array(clump)[:, None] - others[None]).sum(2).min() > near:
+                for q in clump:
+                    filled[q] = False
+                removed += len(clump)
+    return removed
+
+
+def front_dot(filled, snapped, height, radius, rgb, ring=False):
+    """Recolor the frontmost cube of each row in a small disc on the middle of the front (ring: not its middle)."""
+    xs, ys, zs = np.nonzero(filled)
+    zc = int(round(zs.min() + height * (zs.max() - zs.min())))
+    yc = int(round(ys.mean()))
+    for dy in range(-radius, radius + 1):
+        for dz in range(-radius, radius + 1):
+            if dy * dy + dz * dz > radius * radius + radius or (ring and not (dy or dz)):
+                continue
+            y, z = yc + dy, zc + dz
+            if 0 <= y < filled.shape[1] and 0 <= z < filled.shape[2] and filled[:, y, z].any():
+                snapped[np.nonzero(filled[:, y, z])[0].max(), y, z] = rgb
+
+
+def brick_model(m, kind, files, voxels=VOXELS, ncolors=5, sculpt=None, pick=None, code='', client=None):
     """The bricks for one model: (parts, atlas image, uvmap, bricks, brick size), or None without a surface.
     sculpt(head points, head bone, jaw bone) -> (colors by role, [(Part, role)]) replaces the voxel head (the drawn
-    HE piece of an .mds) with a sculpted one."""
+    HE piece of an .mds) with a sculpted one. code/client: for the per-creature tables above."""
+    code = code.upper()
     texs = material_textures(m, files)
     pts, cols, bns = sample_points(m, kind, texs, step=1.0)
     if len(pts) == 0:
         return None
-    ext = np.sort(pts.max(0) - pts.min(0))
-    size = max(min(ext[2] / voxels, ext[1] / 5), 0.05)
-    pts, cols, bns = sample_points(m, kind, texs, step=size / 3)
+    glass_flags = None
+    if code in SURFACE_FROM and client:  # another creature's surface, fitted into this one's height and place
+        arch, prefix, _mat = SURFACE_FROM[code]
+        got = borrowed_surface(client, arch, prefix, 1.0)
+        if got is not None:
+            lo0, hi0 = pts.min(0), pts.max(0)
+            ride = int(np.bincount(bns).argmax())
+            b0 = got[0]
+            scale = (hi0[2] - lo0[2]) / max(np.ptp(b0[:, 2]), 1e-6)
+            fit = lambda p, b0=b0: (p - np.array([(b0[:, 0].min() + b0[:, 0].max()) / 2,
+                                                  (b0[:, 1].min() + b0[:, 1].max()) / 2, b0[:, 2].min()])) * scale + \
+                np.array([(lo0[0] + hi0[0]) / 2, (lo0[1] + hi0[1]) / 2, lo0[2]])
+            ext = np.sort(np.ptp(fit(b0), 0))
+            size = max(min(ext[2] / voxels, ext[1] / 5), 0.05)
+            p2, cols, glass_flags = borrowed_surface(client, arch, prefix, size / 3 / scale)
+            pts, bns = fit(p2), np.full(len(p2), ride)
+            pick = False
+    if glass_flags is None:
+        ext = np.sort(pts.max(0) - pts.min(0))
+        size = max(min(ext[2] / voxels, ext[1] / 5), 0.05)
+        pts, cols, bns = sample_points(m, kind, texs, step=size / 3)
     lo, filled, color, bone = bc.voxelize(pts, cols, bns, size)
     parent = eqgbones.parents(m.bones) if m.bones else [-1]
-    anchored = bc.anchor_limbs(filled, bone, parent, color)
+    kin = eqgbones.helper_kin(parent) if m.bones else None
+    anchored = bc.anchor_limbs(filled, bone, parent, color, kin=kin)
+    if m.bones:
+        anchored += drop_crumbs(filled, bone, parent, kin)
+    if code in PIVOT and m.bones:
+        rest = eqgbones.world(m.bones, parent)
+        anchored += bc.pivot_bridge(filled, bone, color, [(None, parent[k], rest[k]) for k in range(len(parent))],
+                                    lo, size)
+    glass = np.zeros(filled.shape, bool)
+    if glass_flags is not None and glass_flags.any():  # cubes whose samples are mostly on the window
+        idx = np.clip(np.floor((pts - lo) / size).astype(int), 0, np.array(filled.shape) - 1)
+        votes = np.zeros(filled.shape, int)
+        np.add.at(votes, tuple(idx.T), np.where(glass_flags, 1, -1))
+        glass = filled & (votes > 0)
+        fire = bc.fire_colors(glass) if glass.any() else {}
     snapped = bc.smooth_colors(filled, bc.palette_colors(color, filled, ncolors))
+    if code in RECOLOR:
+        for x, y, z in zip(*np.nonzero(filled)):
+            snapped[x, y, z] = RECOLOR[code](tuple(int(a) for a in snapped[x, y, z]))
+    if code in FRONT_DOT:
+        front_dot(filled, snapped, *FRONT_DOT[code])
     classes, cls = {}, np.zeros(color.shape, np.float32)
     for x, y, z in zip(*np.nonzero(filled)):
-        cls[x, y, z] = bc.fake(classes.setdefault(tuple(int(a) for a in snapped[x, y, z]), len(classes)))
+        key = tuple(int(a) for a in snapped[x, y, z])
+        if glass[x, y, z]:  # glass classes stay apart from frame classes of the same color
+            key = tuple(fire[x, y, z]) + ('glass',)
+        cls[x, y, z] = bc.fake(classes.setdefault(key, len(classes)))
     names = [str(k) for k in range(max(1, len(m.bones)))]
     head = []
     if sculpt and kind == 'mds' and m.bones:
@@ -142,8 +274,12 @@ def brick_model(m, kind, files, voxels=VOXELS, ncolors=5, sculpt=None, pick=None
     parts = bc.build_parts(lo, size, filled, cls, bone, names) + head + [p for p, _r in extra]
     imgs, pos = bc.class_atlases(list(classes), 1)
     uvmap = lambda material, u, v: pos[bc.unfake(material)]
-    for p in parts:  # preview colors
-        p.color = list(classes)[bc.unfake(p.material)]
+    keys = list(classes)
+    for p in parts:  # preview colors; glass bricks go on the model's translucent material
+        key = keys[bc.unfake(p.material)]
+        p.color = key[:3]
+        if key[-1] == 'glass':
+            p.mat_index = SURFACE_FROM[code][2]
     return parts, imgs[0], uvmap, int(filled.sum()), size, dict(classes=len(classes), anchored=anchored,
                                                                 eyes=len(extra) // 3)
 
@@ -213,7 +349,7 @@ def geometry(parts, uvmap, has_bones):
                     if has_bones:
                         weights.append([1, [(bi, 1.0), (0, 0.0), (0, 0.0), (0, 0.0)]])
                 ids.append(seen[key])
-            tris.append([ids[0], ids[1], ids[2], 0, 65536])
+            tris.append([ids[0], ids[1], ids[2], getattr(p, 'mat_index', 0), 65536])
     return verts, tris, weights
 
 
@@ -221,8 +357,10 @@ def own_textures(m, code):
     diffuse, normal = f'c_{code}_brick_c.dds', f'c_{code}_brick_n.dds'
     shader = eqgmds.add_string(m, 'Opaque_MaxCBS1.fx')
     d_off, n_off = eqgmds.add_string(m, diffuse), eqgmds.add_string(m, normal)
-    for mat in m.materials:
-        mat[2] = shader
+    keep = SURFACE_FROM.get(code.upper(), (None, None, None))[2]  # the glass bricks' material keeps its blending
+    for k, mat in enumerate(m.materials):
+        if k != keep:
+            mat[2] = shader
         props = []
         for pr in mat[3]:
             pname, ptype = struct.unpack_from('<2I', pr, 0)
@@ -286,7 +424,7 @@ def build_archive(src, dst, codes, preview=None):
         lib = eqgmds if kind == 'mds' else eqgmod
         m = lib.read(fd[f'{code}.{kind}'])
         built = brick_model(m, kind, fd, bc.VOXELS.get(code.upper(), VOXELS), sculpt=HEADS.get(code.upper()),
-                            pick=eye_pick(code))
+                            pick=eye_pick(code), code=code, client=client_of(src))
         if built is None:
             report.append(f'{code}: no surface, left as it was')
             continue
@@ -331,6 +469,12 @@ def build_archive(src, dst, codes, preview=None):
     out = [(n, b) for n, b in out_files.items()] + [(n, b) for n, b in extra.items() if n.lower() not in fd]
     pfs.write(dst, out)
     return report
+
+
+def client_of(src):
+    """The client folder of an archive path (<client>/x.eqg or <client>/brick_orig/x.eqg.orig)."""
+    d = os.path.dirname(os.path.abspath(src))
+    return os.path.dirname(d) if os.path.basename(d).lower() == 'brick_orig' else d
 
 
 def chr_models(path, client):

@@ -173,6 +173,7 @@ def limb_gaps(model, tris, step=0.2):
             if p in has:
                 anc.append(has[p])
             p = model.parent[p] if p < len(model.parent) else -1
+        anc += [has[q] for q in getattr(model, 'kin', {}).get(k, ()) if q in has]  # helper bones (eqg)
         if anc:
             out[k] = gap(has[k], np.concatenate(anc))
     return out
