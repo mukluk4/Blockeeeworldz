@@ -48,6 +48,8 @@ zones/        brick zones, one folder per continent
   luclin/zones.txt    28 zones, the Nexus outward
   pop/zones.txt       24 zones, the Plane of Knowledge outward
   custom/zones.txt     custom zones not in a continent list (incl. .eqg zones)
+  thule/zones.txt      12 House of Thule zones (.eqg)
+  eqg/zones.txt        every other newer .eqg zone, by expansion (Gates of Discord to Rain of Fear)
   eqgzone.py          brickzone for .eqg zones (DXT1/3/5, uncompressed, mips; normal maps left alone)
 
 scripts/

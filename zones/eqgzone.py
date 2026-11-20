@@ -17,8 +17,8 @@ _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [os.path.join(_root, d) for d in ('lib', 'characters', 'zones')]
 import brickzone, make_s3d, pfs
 
-# Textures a zone keeps as they were, by the user's call: The Void A's starfield walls keep their space look.
-KEEP = {'thevoida': {'stars_02.dds'}}
+# Textures a zone keeps as they were, by the user's call: The Void's starfield walls keep their space look (A to G).
+KEEP = {f'thevoid{z}': {'stars_02.dds'} for z in 'abcdefg'}
 HELPER = re.compile(r'_([a-bd-z])(_\d+)?\.dds$')  # _n normal, _b, _e ... : not color
 
 

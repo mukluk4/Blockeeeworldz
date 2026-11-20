@@ -16,3 +16,4 @@ frostcrypt
 oldkaesoraa
 riftseekers
 somnium
+guildlobby

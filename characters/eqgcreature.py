@@ -217,6 +217,7 @@ def brick_model(m, kind, files, voxels=VOXELS, ncolors=5, sculpt=None, pick=None
         pts, cols, bns = sample_points(m, kind, texs, step=size / 3)
     lo, filled, color, bone = bc.voxelize(pts, cols, bns, size)
     parent = eqgbones.parents(m.bones) if m.bones else [-1]
+    bone[bone >= len(parent)] = 0  # weights on a bone past the skeleton (I00) ride the root
     kin = eqgbones.helper_kin(parent) if m.bones else None
     anchored = bc.anchor_limbs(filled, bone, parent, color, kin=kin)
     if m.bones:
